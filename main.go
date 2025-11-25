@@ -104,25 +104,27 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-v] [-json] <msg-file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-v] [-json] <email-file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSupported formats: .msg, .eml\n")
 		fmt.Fprintf(os.Stderr, "\nOptions:\n")
 		fmt.Fprintf(os.Stderr, "  -v       Verbose output (include all raw headers)\n")
 		fmt.Fprintf(os.Stderr, "  -json    Output results as JSON\n")
-		fmt.Fprintf(os.Stderr, "\nExample:\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s sample-email.msg\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -json sample-email.msg\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s sample-email.eml\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -json sample-email.eml\n", os.Args[0])
 		os.Exit(1)
 	}
 
 	msgFile := flag.Arg(0)
 
-	// Parse the .msg file
-	report, err := parseMsgFile(msgFile, *verbose)
+	// Parse the email file (.msg or .eml)
+	report, err := parseEmailFile(msgFile, *verbose)
 	if err != nil {
 		// Log detailed error internally for debugging
 		log.Printf("Internal error: %+v", err)
 		// Show sanitized error to user
-		fmt.Fprintf(os.Stderr, "Error: Failed to parse email file. Please ensure the file is a valid .msg format.\n")
+		fmt.Fprintf(os.Stderr, "Error: Failed to parse email file. Please ensure the file is a valid .msg or .eml format.\n")
 		os.Exit(1)
 	}
 
@@ -134,11 +136,12 @@ func main() {
 	}
 }
 
-// parseMsgFile parses a .msg file and extracts email security information
-func parseMsgFile(filename string, includeRawHeaders bool) (*EmailSecurityReport, error) {
+// parseEmailFile parses a .msg or .eml file and extracts email security information
+func parseEmailFile(filename string, includeRawHeaders bool) (*EmailSecurityReport, error) {
 	// Validate file extension
-	if !strings.HasSuffix(strings.ToLower(filename), ".msg") {
-		return nil, eris.New("file must have .msg extension")
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".msg" && ext != ".eml" {
+		return nil, eris.New("file must have .msg or .eml extension")
 	}
 
 	// Clean path and prevent traversal
@@ -182,32 +185,46 @@ func parseMsgFile(filename string, includeRawHeaders bool) (*EmailSecurityReport
 		return nil, eris.New("invalid negative file size")
 	}
 
-	// Verify file magic bytes for OLE/CFBF or ZIP format
-	magic := make([]byte, 8)
-	if _, err := f.Read(magic); err != nil {
-		return nil, eris.Wrap(err, "failed to read file header")
-	}
+	var emailData []byte
 
-	// Check for CFBF signature (D0 CF 11 E0 A1 B1 1A E1)
-	// or ZIP signature (50 4B 03 04 or 50 4B 05 06)
-	isCFBF := len(magic) >= 8 && bytes.Equal(magic, []byte{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1})
-	isZIP := len(magic) >= 2 && magic[0] == 0x50 && magic[1] == 0x4B
+	// EML files are already RFC822 format - read directly
+	// MSG files need extraction from binary format
+	if ext == ".eml" {
+		// Read EML file directly (already RFC822 format)
+		limitReader := io.LimitReader(f, MaxFileSizeBytes)
+		emailData, err = io.ReadAll(limitReader)
+		if err != nil {
+			return nil, eris.Wrap(err, "failed to read EML file")
+		}
+	} else {
+		// MSG file processing - verify format and extract
+		// Verify file magic bytes for OLE/CFBF or ZIP format
+		magic := make([]byte, 8)
+		if _, err := f.Read(magic); err != nil {
+			return nil, eris.Wrap(err, "failed to read file header")
+		}
 
-	if !isCFBF && !isZIP {
-		return nil, eris.New("file is not a valid .msg format (invalid file signature)")
-	}
+		// Check for CFBF signature (D0 CF 11 E0 A1 B1 1A E1)
+		// or ZIP signature (50 4B 03 04 or 50 4B 05 06)
+		isCFBF := len(magic) >= 8 && bytes.Equal(magic, []byte{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1})
+		isZIP := len(magic) >= 2 && magic[0] == 0x50 && magic[1] == 0x4B
 
-	// Seek back to start
-	if _, err := f.Seek(0, 0); err != nil {
-		return nil, eris.Wrap(err, "failed to seek file")
-	}
+		if !isCFBF && !isZIP {
+			return nil, eris.New("file is not a valid .msg format (invalid file signature)")
+		}
 
-	// Try to extract email content from MSG file
-	// MSG files are OLE/CFBF format, but we'll try a simpler approach first
-	// by looking for embedded RFC822 message
-	emailData, err := extractEmailFromMsg(f, stat.Size())
-	if err != nil {
-		return nil, eris.Wrap(err, "failed to extract email from MSG file")
+		// Seek back to start
+		if _, err := f.Seek(0, 0); err != nil {
+			return nil, eris.Wrap(err, "failed to seek file")
+		}
+
+		// Try to extract email content from MSG file
+		// MSG files are OLE/CFBF format, but we'll try a simpler approach first
+		// by looking for embedded RFC822 message
+		emailData, err = extractEmailFromMsg(f, stat.Size())
+		if err != nil {
+			return nil, eris.Wrap(err, "failed to extract email from MSG file")
+		}
 	}
 
 	// Parse the email
