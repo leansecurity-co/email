@@ -1,5 +1,7 @@
 # Email
 
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/leansecurity-co/email?utm_source=oss&utm_medium=github&utm_campaign=leansecurity-co%2Femail&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+
 A Golang tool for analyzing email security authentication headers (SPF, DKIM, DMARC, and ARC) from `.msg` and `.eml` files.
 
 ## Features
