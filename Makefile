@@ -51,7 +51,7 @@ vet:
 	$(GO) vet ./...
 
 lint:
-	@which $(LINTER) > /dev/null || (echo "Installing $(LINTER)..." && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
+	@which $(LINTER) > /dev/null || (echo "Installing $(LINTER)..." && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest)
 	$(LINTER) run ./...
 
 check: fmt vet lint test
