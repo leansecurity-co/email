@@ -147,4 +147,4 @@ Parsed headers include: `Received-SPF`, `DKIM-Signature`, `Authentication-Result
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Apache License 2.0 - see [LICENSE](LICENSE) file for details.
