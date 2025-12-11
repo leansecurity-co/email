@@ -1,10 +1,10 @@
-# Email Watch - Usage Guide
+# Email - Usage Guide
 
 ## Quick Start
 
 ```bash
-./email-watch sample.msg
-./email-watch sample.eml
+./email sample.msg
+./email sample.eml
 ```
 
 ## Common Use Cases
@@ -12,41 +12,41 @@
 ### Basic Analysis
 
 ```bash
-./email-watch suspicious-email.msg
-./email-watch phishing-sample.eml
+./email suspicious-email.msg
+./email phishing-sample.eml
 ```
 
 ### Detailed Analysis with All Headers
 
 ```bash
-./email-watch -v sample.msg
+./email -v sample.msg
 ```
 
 ### Export to JSON
 
 ```bash
-./email-watch -json sample.eml > results.json
+./email -json sample.eml > results.json
 ```
 
 ### Batch Processing
 
 ```bash
 for file in emails/*.{msg,eml}; do
-    ./email-watch -json "$file" > "results/$(basename "$file" | cut -d. -f1).json"
+    ./email -json "$file" > "results/$(basename "$file" | cut -d. -f1).json"
 done
 ```
 
 ### Quick Security Check
 
 ```bash
-./email-watch email.msg | grep "Overall Assessment"
+./email email.msg | grep "Overall Assessment"
 ```
 
 ### Extract Specific Information
 
 ```bash
-./email-watch -json email.msg | jq '.spf_results'
-./email-watch -json email.eml | jq '.dkim_results'
+./email -json email.msg | jq '.spf_results'
+./email -json email.eml | jq '.dkim_results'
 ```
 
 ## Interpreting Results
@@ -73,7 +73,7 @@ The file may be corrupted or use an unsupported format. Try re-exporting from Ou
 
 ### "Failed to parse email message"
 
-Use verbose mode to see extracted headers: `./email-watch -v file.msg`
+Use verbose mode to see extracted headers: `./email -v file.msg`
 
 ### No Authentication Results
 
@@ -87,7 +87,7 @@ Internal emails and emails from legacy systems may not have authentication heade
 import subprocess
 import json
 
-result = subprocess.run(['./email-watch', '-json', 'sample.msg'],
+result = subprocess.run(['./email', '-json', 'sample.msg'],
                        capture_output=True, text=True)
 report = json.loads(result.stdout)
 print(f"SPF: {report['spf_results'][0]['result']}")
@@ -97,7 +97,7 @@ print(f"SPF: {report['spf_results'][0]['result']}")
 
 ```bash
 for file in emails/*.{msg,eml}; do
-    assessment=$(./email-watch "$file" | grep "Overall Assessment")
+    assessment=$(./email "$file" | grep "Overall Assessment")
     if echo "$assessment" | grep -q "SECURE"; then
         echo "✓ $file: Safe"
     else
@@ -110,8 +110,8 @@ done
 
 ```bash
 # Find emails that failed SPF
-./email-watch -json sample.msg | jq 'select(.spf_results[].result=="fail")'
+./email -json sample.msg | jq 'select(.spf_results[].result=="fail")'
 
 # Extract sender domains
-./email-watch -json sample.eml | jq -r '.from' | grep -oE '[^@]+@[^>]+'
+./email -json sample.eml | jq -r '.from' | grep -oE '[^@]+@[^>]+'
 ```

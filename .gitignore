@@ -23,8 +23,6 @@ vendor/
 dist/
 build/
 
-# Compiled binary - specific to this project
-email-watch
 
 # IDE and editor files
 .vscode/

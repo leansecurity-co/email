@@ -1,4 +1,4 @@
-# Email Watch
+# Email
 
 A Golang tool for analyzing email security authentication headers (SPF, DKIM, DMARC, and ARC) from `.msg` and `.eml` files.
 
