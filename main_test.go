@@ -1082,8 +1082,8 @@ func TestSanitizeDMARCDomain(t *testing.T) {
 	}{
 		{"example.com", "example.com"},
 		{"  example.com  ", "example.com"},
-		{"example\x00.com", "example.com"}, // null byte removed
-		{"example\n.com", "example.com"},   // newline removed
+		{"example\x00.com", "example.com"},                   // null byte removed
+		{"example\n.com", "example.com"},                     // newline removed
 		{strings.Repeat("a", 300), strings.Repeat("a", 255)}, // truncated to 255
 	}
 

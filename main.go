@@ -151,13 +151,13 @@ type DMARCDateRange struct {
 // DMARCPolicyPublished represents the domain's DMARC policy at report time
 type DMARCPolicyPublished struct {
 	Domain          string `xml:"domain" json:"domain"`
-	ADKIM           string `xml:"adkim" json:"adkim"`                       // r=relaxed, s=strict
-	ASPF            string `xml:"aspf" json:"aspf"`                         // r=relaxed, s=strict
-	Policy          string `xml:"p" json:"p"`                               // none, quarantine, reject
-	SubdomainPolicy string `xml:"sp" json:"sp"`                             // none, quarantine, reject
-	Percentage      int    `xml:"pct" json:"pct"`                           // 0-100
-	FailureOptions  string `xml:"fo,omitempty" json:"fo,omitempty"`         // 0, 1, d, s
-	NoPolicy        string `xml:"np,omitempty" json:"np,omitempty"`         // non-existent subdomain policy
+	ADKIM           string `xml:"adkim" json:"adkim"`               // r=relaxed, s=strict
+	ASPF            string `xml:"aspf" json:"aspf"`                 // r=relaxed, s=strict
+	Policy          string `xml:"p" json:"p"`                       // none, quarantine, reject
+	SubdomainPolicy string `xml:"sp" json:"sp"`                     // none, quarantine, reject
+	Percentage      int    `xml:"pct" json:"pct"`                   // 0-100
+	FailureOptions  string `xml:"fo,omitempty" json:"fo,omitempty"` // 0, 1, d, s
+	NoPolicy        string `xml:"np,omitempty" json:"np,omitempty"` // non-existent subdomain policy
 }
 
 // DMARCAggregateRecord represents a single record in the report
@@ -170,8 +170,8 @@ type DMARCAggregateRecord struct {
 
 // DMARCRow contains the core authentication data
 type DMARCRow struct {
-	SourceIP        string              `xml:"source_ip" json:"source_ip"`
-	Count           int                 `xml:"count" json:"count"`
+	SourceIP        string               `xml:"source_ip" json:"source_ip"`
+	Count           int                  `xml:"count" json:"count"`
 	PolicyEvaluated DMARCPolicyEvaluated `xml:"policy_evaluated" json:"policy_evaluated"`
 }
 
@@ -185,7 +185,7 @@ type DMARCPolicyEvaluated struct {
 
 // DMARCPolicyReason explains override decisions
 type DMARCPolicyReason struct {
-	Type    string `xml:"type" json:"type"`       // forwarded, local_policy, etc.
+	Type    string `xml:"type" json:"type"` // forwarded, local_policy, etc.
 	Comment string `xml:"comment" json:"comment"`
 }
 
@@ -230,16 +230,16 @@ type IPEnrichment struct {
 
 // DMARCReportAnalysis contains aggregated forensic analysis
 type DMARCReportAnalysis struct {
-	TotalEmails        int                    `json:"total_emails"`
-	PassRate           float64                `json:"pass_rate"`
-	SPFPassRate        float64                `json:"spf_pass_rate"`
-	DKIMPassRate       float64                `json:"dkim_pass_rate"`
-	DispositionStats   map[string]int         `json:"disposition_stats"`
-	TopSourceCountries []DMARCCountryStat     `json:"top_source_countries,omitempty"`
-	TopASNs            []DMARCASNStat         `json:"top_asns,omitempty"`
-	FailingSources     []DMARCFailingSource   `json:"failing_sources,omitempty"`
-	Recommendations    []DMARCRecommendation  `json:"recommendations,omitempty"`
-	OverallThreatLevel string                 `json:"overall_threat_level"`
+	TotalEmails        int                   `json:"total_emails"`
+	PassRate           float64               `json:"pass_rate"`
+	SPFPassRate        float64               `json:"spf_pass_rate"`
+	DKIMPassRate       float64               `json:"dkim_pass_rate"`
+	DispositionStats   map[string]int        `json:"disposition_stats"`
+	TopSourceCountries []DMARCCountryStat    `json:"top_source_countries,omitempty"`
+	TopASNs            []DMARCASNStat        `json:"top_asns,omitempty"`
+	FailingSources     []DMARCFailingSource  `json:"failing_sources,omitempty"`
+	Recommendations    []DMARCRecommendation `json:"recommendations,omitempty"`
+	OverallThreatLevel string                `json:"overall_threat_level"`
 }
 
 // DMARCCountryStat represents email volume by country
