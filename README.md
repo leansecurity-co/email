@@ -28,7 +28,11 @@ A Golang tool for analyzing email security authentication headers (SPF, DKIM, DM
 Requires Go 1.20 or later.
 
 ```bash
+# Install latest version
 go install github.com/leansecurity-co/email@latest
+
+# Install specific version (v0.2.0 - includes DMARC report analysis)
+go install github.com/leansecurity-co/email@v0.2.0
 ```
 
 To uninstall:
