@@ -2,19 +2,25 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/emersion/go-message/charset"
+	"github.com/oschwald/geoip2-golang"
 	"github.com/rotisserie/eris"
 	"github.com/yeka/zip"
 )
@@ -28,6 +34,12 @@ const (
 	MaxCompressionRatio  = 100               // 100:1 compression ratio limit
 	MaxHeaderSearchBytes = 10000             // Limit for binary header search
 	MaxRegexMatches      = 50                // Limit regex matches to prevent ReDoS
+
+	// DMARC aggregate report limits
+	MaxDMARCReportSize  = 50 * 1024 * 1024 // 50MB max DMARC report size
+	MaxRecordsPerReport = 100000           // Maximum records in a DMARC report
+	MaxStringLength     = 10000            // Maximum string field length in DMARC report
+	MaxRecordCount      = 1000000000       // Maximum email count per record (1 billion)
 )
 
 // EmailSecurityReport contains the analysis results of email security headers
@@ -107,7 +119,214 @@ type SCLResult struct {
 	RawHeader    string `json:"raw_header"`    // Full header value
 }
 
+// ============================================================================
+// DMARC Aggregate Report Types (RFC 7489)
+// ============================================================================
+
+// DMARCAggregateReport represents a complete DMARC aggregate report
+type DMARCAggregateReport struct {
+	XMLName         xml.Name               `xml:"feedback" json:"-"`
+	Version         string                 `xml:"version" json:"version,omitempty"`
+	Metadata        DMARCReportMetadata    `xml:"report_metadata" json:"metadata"`
+	PolicyPublished DMARCPolicyPublished   `xml:"policy_published" json:"policy_published"`
+	Records         []DMARCAggregateRecord `xml:"record" json:"records"`
+	Analysis        *DMARCReportAnalysis   `json:"analysis,omitempty"`
+}
+
+// DMARCReportMetadata contains report identification information
+type DMARCReportMetadata struct {
+	OrgName          string         `xml:"org_name" json:"org_name"`
+	Email            string         `xml:"email" json:"email"`
+	ExtraContactInfo string         `xml:"extra_contact_info,omitempty" json:"extra_contact_info,omitempty"`
+	ReportID         string         `xml:"report_id" json:"report_id"`
+	DateRange        DMARCDateRange `xml:"date_range" json:"date_range"`
+}
+
+// DMARCDateRange represents the reporting period
+type DMARCDateRange struct {
+	Begin int64 `xml:"begin" json:"begin"`
+	End   int64 `xml:"end" json:"end"`
+}
+
+// DMARCPolicyPublished represents the domain's DMARC policy at report time
+type DMARCPolicyPublished struct {
+	Domain          string `xml:"domain" json:"domain"`
+	ADKIM           string `xml:"adkim" json:"adkim"`                       // r=relaxed, s=strict
+	ASPF            string `xml:"aspf" json:"aspf"`                         // r=relaxed, s=strict
+	Policy          string `xml:"p" json:"p"`                               // none, quarantine, reject
+	SubdomainPolicy string `xml:"sp" json:"sp"`                             // none, quarantine, reject
+	Percentage      int    `xml:"pct" json:"pct"`                           // 0-100
+	FailureOptions  string `xml:"fo,omitempty" json:"fo,omitempty"`         // 0, 1, d, s
+	NoPolicy        string `xml:"np,omitempty" json:"np,omitempty"`         // non-existent subdomain policy
+}
+
+// DMARCAggregateRecord represents a single record in the report
+type DMARCAggregateRecord struct {
+	Row         DMARCRow         `xml:"row" json:"row"`
+	Identifiers DMARCIdentifiers `xml:"identifiers" json:"identifiers"`
+	AuthResults DMARCAuthResults `xml:"auth_results" json:"auth_results"`
+	Enrichment  *IPEnrichment    `json:"enrichment,omitempty"`
+}
+
+// DMARCRow contains the core authentication data
+type DMARCRow struct {
+	SourceIP        string              `xml:"source_ip" json:"source_ip"`
+	Count           int                 `xml:"count" json:"count"`
+	PolicyEvaluated DMARCPolicyEvaluated `xml:"policy_evaluated" json:"policy_evaluated"`
+}
+
+// DMARCPolicyEvaluated contains the disposition and authentication results
+type DMARCPolicyEvaluated struct {
+	Disposition string              `xml:"disposition" json:"disposition"` // none, quarantine, reject
+	DKIM        string              `xml:"dkim" json:"dkim"`               // pass, fail
+	SPF         string              `xml:"spf" json:"spf"`                 // pass, fail
+	Reason      []DMARCPolicyReason `xml:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// DMARCPolicyReason explains override decisions
+type DMARCPolicyReason struct {
+	Type    string `xml:"type" json:"type"`       // forwarded, local_policy, etc.
+	Comment string `xml:"comment" json:"comment"`
+}
+
+// DMARCIdentifiers contains domain identifiers
+type DMARCIdentifiers struct {
+	EnvelopeTo   string `xml:"envelope_to,omitempty" json:"envelope_to,omitempty"`
+	EnvelopeFrom string `xml:"envelope_from,omitempty" json:"envelope_from,omitempty"`
+	HeaderFrom   string `xml:"header_from" json:"header_from"`
+}
+
+// DMARCAuthResults contains SPF and DKIM authentication details
+type DMARCAuthResults struct {
+	DKIM []DMARCDKIMAuthResult `xml:"dkim,omitempty" json:"dkim,omitempty"`
+	SPF  []DMARCSPFAuthResult  `xml:"spf,omitempty" json:"spf,omitempty"`
+}
+
+// DMARCDKIMAuthResult represents a DKIM authentication check in DMARC report
+type DMARCDKIMAuthResult struct {
+	Domain      string `xml:"domain" json:"domain"`
+	Selector    string `xml:"selector,omitempty" json:"selector,omitempty"`
+	Result      string `xml:"result" json:"result"` // pass, fail, neutral, etc.
+	HumanResult string `xml:"human_result,omitempty" json:"human_result,omitempty"`
+}
+
+// DMARCSPFAuthResult represents an SPF authentication check in DMARC report
+type DMARCSPFAuthResult struct {
+	Domain string `xml:"domain" json:"domain"`
+	Scope  string `xml:"scope,omitempty" json:"scope,omitempty"` // mfrom, helo
+	Result string `xml:"result" json:"result"`                   // pass, fail, softfail, etc.
+}
+
+// IPEnrichment contains geolocation and threat data for an IP
+type IPEnrichment struct {
+	Country      string  `json:"country,omitempty"`
+	CountryCode  string  `json:"country_code,omitempty"`
+	City         string  `json:"city,omitempty"`
+	ASN          uint    `json:"asn,omitempty"`
+	Organization string  `json:"organization,omitempty"`
+	ThreatScore  float64 `json:"threat_score"`
+	ThreatLevel  string  `json:"threat_level"` // low, medium, high, critical
+}
+
+// DMARCReportAnalysis contains aggregated forensic analysis
+type DMARCReportAnalysis struct {
+	TotalEmails        int                    `json:"total_emails"`
+	PassRate           float64                `json:"pass_rate"`
+	SPFPassRate        float64                `json:"spf_pass_rate"`
+	DKIMPassRate       float64                `json:"dkim_pass_rate"`
+	DispositionStats   map[string]int         `json:"disposition_stats"`
+	TopSourceCountries []DMARCCountryStat     `json:"top_source_countries,omitempty"`
+	TopASNs            []DMARCASNStat         `json:"top_asns,omitempty"`
+	FailingSources     []DMARCFailingSource   `json:"failing_sources,omitempty"`
+	Recommendations    []DMARCRecommendation  `json:"recommendations,omitempty"`
+	OverallThreatLevel string                 `json:"overall_threat_level"`
+}
+
+// DMARCCountryStat represents email volume by country
+type DMARCCountryStat struct {
+	Country     string `json:"country"`
+	CountryCode string `json:"country_code"`
+	EmailCount  int    `json:"email_count"`
+	FailCount   int    `json:"fail_count"`
+}
+
+// DMARCASNStat represents email volume by ASN
+type DMARCASNStat struct {
+	ASN          uint   `json:"asn"`
+	Organization string `json:"organization"`
+	EmailCount   int    `json:"email_count"`
+	FailCount    int    `json:"fail_count"`
+}
+
+// DMARCFailingSource represents a source with authentication failures
+type DMARCFailingSource struct {
+	IP           string `json:"ip"`
+	Country      string `json:"country,omitempty"`
+	Organization string `json:"organization,omitempty"`
+	FailCount    int    `json:"fail_count"`
+	FailReason   string `json:"fail_reason"`
+}
+
+// DMARCRecommendation represents an actionable suggestion
+type DMARCRecommendation struct {
+	Priority    string `json:"priority"` // high, medium, low
+	Category    string `json:"category"` // policy, spf, dkim, monitoring
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Action      string `json:"action"`
+}
+
 func main() {
+	// Check if first arg is a subcommand
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "dmarc":
+			runDMARCCommand(os.Args[2:])
+			return
+		case "help", "-h", "--help":
+			printHelp()
+			return
+		case "version", "-V", "--version":
+			fmt.Println("email v1.1.0")
+			return
+		}
+	}
+
+	// Default: existing email analysis behavior
+	runEmailAnalysis()
+}
+
+// printHelp displays help information for all commands
+func printHelp() {
+	fmt.Println("email - Email Security Analysis Tool")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Println("  email [-v] [-json] <email-file>          Analyze email headers")
+	fmt.Println("  email dmarc [options] <report-file>      Analyze DMARC aggregate report")
+	fmt.Println("  email help                               Show this help message")
+	fmt.Println("  email version                            Show version information")
+	fmt.Println()
+	fmt.Println("EMAIL ANALYSIS OPTIONS:")
+	fmt.Println("  -v           Verbose output (include all raw headers)")
+	fmt.Println("  -json        Output results as JSON")
+	fmt.Println()
+	fmt.Println("DMARC REPORT OPTIONS:")
+	fmt.Println("  -v           Verbose output (show all records)")
+	fmt.Println("  -json        Output as JSON")
+	fmt.Println("  -md          Output as Markdown")
+	fmt.Println("  -no-enrich   Skip IP geolocation enrichment")
+	fmt.Println("  -geoip-db    Path to MaxMind GeoIP2 database")
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  email sample.msg                         Analyze an email file")
+	fmt.Println("  email -json sample.eml                   Output email analysis as JSON")
+	fmt.Println("  email dmarc report.xml                   Analyze DMARC report")
+	fmt.Println("  email dmarc -json report.xml.gz          Output DMARC analysis as JSON")
+	fmt.Println("  email dmarc -md report.zip               Output DMARC analysis as Markdown")
+}
+
+// runEmailAnalysis runs the original email header analysis
+func runEmailAnalysis() {
 	// Parse command-line flags
 	verbose := flag.Bool("v", false, "Verbose output (include raw headers)")
 	jsonOutput := flag.Bool("json", false, "Output results as JSON")
@@ -123,6 +342,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s sample-email.msg\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s sample-email.eml\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -json sample-email.eml\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSubcommands:\n")
+		fmt.Fprintf(os.Stderr, "  %s dmarc <report-file>   Analyze DMARC aggregate reports\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s help                  Show detailed help\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -143,6 +365,65 @@ func main() {
 		outputJSON(report)
 	} else {
 		outputText(report, *verbose)
+	}
+}
+
+// runDMARCCommand handles the dmarc subcommand for parsing DMARC aggregate reports
+func runDMARCCommand(args []string) {
+	// Create new FlagSet for dmarc subcommand
+	dmarcFlags := flag.NewFlagSet("dmarc", flag.ExitOnError)
+	verbose := dmarcFlags.Bool("v", false, "Verbose output (show all records)")
+	jsonOutput := dmarcFlags.Bool("json", false, "Output as JSON")
+	markdownOutput := dmarcFlags.Bool("md", false, "Output as Markdown")
+	noEnrich := dmarcFlags.Bool("no-enrich", false, "Skip IP geolocation enrichment")
+	geoDBPath := dmarcFlags.String("geoip-db", "", "Path to GeoIP2 database")
+
+	if err := dmarcFlags.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if dmarcFlags.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s dmarc [-v] [-json|-md] [-no-enrich] [-geoip-db PATH] <report-file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nSupported formats: .xml, .xml.gz, .zip\n")
+		fmt.Fprintf(os.Stderr, "\nOptions:\n")
+		fmt.Fprintf(os.Stderr, "  -v           Verbose output (show all records)\n")
+		fmt.Fprintf(os.Stderr, "  -json        Output as JSON\n")
+		fmt.Fprintf(os.Stderr, "  -md          Output as Markdown\n")
+		fmt.Fprintf(os.Stderr, "  -no-enrich   Skip IP geolocation enrichment\n")
+		fmt.Fprintf(os.Stderr, "  -geoip-db    Path to MaxMind GeoIP2 database\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s dmarc google-report.xml\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s dmarc -json report.xml.gz > analysis.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s dmarc -md report.zip > report.md\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	reportFile := dmarcFlags.Arg(0)
+
+	// Parse the DMARC report
+	report, err := parseDMARCReportFile(reportFile)
+	if err != nil {
+		log.Printf("Internal error: %+v", err)
+		fmt.Fprintf(os.Stderr, "Error: Failed to parse DMARC report. %s\n", sanitizeDMARCError(err))
+		os.Exit(1)
+	}
+
+	// Enrich with IP data unless disabled
+	if !*noEnrich {
+		enrichDMARCReport(report, *geoDBPath)
+	}
+
+	// Analyze the report
+	report.Analysis = analyzeDMARCReport(report)
+
+	// Output based on format
+	switch {
+	case *jsonOutput:
+		outputDMARCJSON(report)
+	case *markdownOutput:
+		outputDMARCMarkdown(report, *verbose)
+	default:
+		outputDMARCText(report, *verbose)
 	}
 }
 
@@ -1341,6 +1622,1052 @@ func formatBool(b bool) string {
 		return "PASS ✓"
 	}
 	return "FAIL ✗"
+}
+
+// ============================================================================
+// DMARC Aggregate Report Parsing Functions
+// ============================================================================
+
+// parseDMARCReportFile parses a DMARC aggregate report from file
+// Supports .xml, .xml.gz, and .zip formats
+func parseDMARCReportFile(filename string) (*DMARCAggregateReport, error) {
+	// Validate file extension
+	lowerName := strings.ToLower(filename)
+	validExt := strings.HasSuffix(lowerName, ".xml") ||
+		strings.HasSuffix(lowerName, ".xml.gz") ||
+		strings.HasSuffix(lowerName, ".gz") ||
+		strings.HasSuffix(lowerName, ".zip")
+
+	if !validExt {
+		return nil, eris.New("file must have .xml, .xml.gz, or .zip extension")
+	}
+
+	// Security: path validation (reuse existing pattern)
+	cleanPath := filepath.Clean(filename)
+	if strings.Contains(filename, "..") {
+		return nil, eris.New("path traversal detected")
+	}
+
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return nil, eris.Wrap(err, "invalid file path")
+	}
+
+	f, err := os.Open(absPath)
+	if err != nil {
+		return nil, eris.Wrap(err, "failed to open DMARC report file")
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, eris.Wrap(err, "failed to stat file")
+	}
+
+	if !stat.Mode().IsRegular() {
+		return nil, eris.New("not a regular file")
+	}
+
+	if stat.Size() > MaxDMARCReportSize {
+		return nil, eris.Errorf("file size %d exceeds maximum %d bytes", stat.Size(), MaxDMARCReportSize)
+	}
+
+	// Determine format and parse
+	var reader io.Reader
+	switch {
+	case strings.HasSuffix(lowerName, ".xml.gz") || strings.HasSuffix(lowerName, ".gz"):
+		gzReader, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, eris.Wrap(err, "failed to create gzip reader")
+		}
+		defer func() { _ = gzReader.Close() }()
+		reader = io.LimitReader(gzReader, MaxDMARCReportSize)
+
+	case strings.HasSuffix(lowerName, ".zip"):
+		xmlData, err := extractXMLFromDMARCZip(f, stat.Size())
+		if err != nil {
+			return nil, eris.Wrap(err, "failed to extract XML from ZIP")
+		}
+		reader = bytes.NewReader(xmlData)
+
+	default: // .xml
+		reader = io.LimitReader(f, MaxDMARCReportSize)
+	}
+
+	return parseDMARCReportSecure(reader)
+}
+
+// extractXMLFromDMARCZip safely extracts DMARC XML from a ZIP archive
+func extractXMLFromDMARCZip(r io.ReaderAt, size int64) ([]byte, error) {
+	zr, err := zip.NewReader(r, size)
+	if err != nil {
+		return nil, eris.Wrap(err, "failed to open ZIP archive")
+	}
+
+	// Check number of files
+	if len(zr.File) > MaxZipFiles {
+		return nil, eris.Errorf("zip contains too many files: %d (max %d)", len(zr.File), MaxZipFiles)
+	}
+
+	// Find XML file in the archive
+	for _, f := range zr.File {
+		// Check compression ratio
+		if f.UncompressedSize64 > 0 && f.CompressedSize64 > 0 {
+			ratio := f.UncompressedSize64 / f.CompressedSize64
+			if ratio > MaxCompressionRatio {
+				return nil, eris.Errorf("suspicious compression ratio: %d:1 (max %d:1)", ratio, MaxCompressionRatio)
+			}
+		}
+
+		// Check uncompressed size
+		if f.UncompressedSize64 > MaxUncompressedSize {
+			return nil, eris.Errorf("uncompressed file too large: %d bytes (max %d)", f.UncompressedSize64, MaxUncompressedSize)
+		}
+
+		// Look for XML files
+		if strings.HasSuffix(strings.ToLower(f.Name), ".xml") {
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+
+			data, err := func() ([]byte, error) {
+				defer func() { _ = rc.Close() }()
+				limitReader := io.LimitReader(rc, MaxUncompressedSize)
+				return io.ReadAll(limitReader)
+			}()
+			if err != nil {
+				continue
+			}
+
+			// Verify it looks like a DMARC report
+			if bytes.Contains(data, []byte("<feedback")) || bytes.Contains(data, []byte("<report_metadata")) {
+				return data, nil
+			}
+		}
+	}
+
+	return nil, eris.New("no DMARC XML file found in ZIP archive")
+}
+
+// parseDMARCReportSecure parses DMARC XML with security controls
+func parseDMARCReportSecure(r io.Reader) (*DMARCAggregateReport, error) {
+	// Create decoder with XXE prevention
+	decoder := xml.NewDecoder(r)
+	decoder.Entity = make(map[string]string) // Disable external entities
+
+	var report DMARCAggregateReport
+	if err := decoder.Decode(&report); err != nil {
+		return nil, eris.Wrap(err, "failed to parse DMARC XML")
+	}
+
+	// Validate parsed data
+	if err := validateDMARCReport(&report); err != nil {
+		return nil, err
+	}
+
+	return &report, nil
+}
+
+// validateDMARCReport performs security validation on parsed report
+func validateDMARCReport(report *DMARCAggregateReport) error {
+	// Validate record count
+	if len(report.Records) > MaxRecordsPerReport {
+		return eris.Errorf("report contains %d records, exceeds limit of %d",
+			len(report.Records), MaxRecordsPerReport)
+	}
+
+	// Validate string lengths
+	if len(report.Metadata.OrgName) > MaxStringLength {
+		return eris.New("org_name exceeds maximum length")
+	}
+	if len(report.Metadata.ReportID) > MaxStringLength {
+		return eris.New("report_id exceeds maximum length")
+	}
+
+	// Validate date range
+	if report.Metadata.DateRange.Begin < 0 || report.Metadata.DateRange.End < 0 {
+		return eris.New("invalid negative timestamp in date_range")
+	}
+	if report.Metadata.DateRange.End < report.Metadata.DateRange.Begin {
+		return eris.New("date_range end is before begin")
+	}
+
+	// Validate each record
+	for i := range report.Records {
+		if err := validateDMARCRecord(&report.Records[i], i); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateDMARCRecord validates a single DMARC record
+func validateDMARCRecord(record *DMARCAggregateRecord, index int) error {
+	// Validate IP address format
+	ip := net.ParseIP(record.Row.SourceIP)
+	if ip == nil {
+		return eris.Errorf("record %d: invalid source_ip: %s", index, record.Row.SourceIP)
+	}
+
+	// Validate count is positive and within bounds
+	if record.Row.Count < 0 {
+		return eris.Errorf("record %d: invalid negative count", index)
+	}
+	if record.Row.Count > MaxRecordCount {
+		return eris.Errorf("record %d: count %d exceeds limit of %d", index, record.Row.Count, MaxRecordCount)
+	}
+
+	// Validate disposition value
+	validDispositions := map[string]bool{"none": true, "quarantine": true, "reject": true, "": true}
+	if !validDispositions[strings.ToLower(record.Row.PolicyEvaluated.Disposition)] {
+		return eris.Errorf("record %d: invalid disposition: %s", index, record.Row.PolicyEvaluated.Disposition)
+	}
+
+	// Sanitize domain names
+	record.Identifiers.HeaderFrom = sanitizeDMARCDomain(record.Identifiers.HeaderFrom)
+	record.Identifiers.EnvelopeFrom = sanitizeDMARCDomain(record.Identifiers.EnvelopeFrom)
+	record.Identifiers.EnvelopeTo = sanitizeDMARCDomain(record.Identifiers.EnvelopeTo)
+
+	return nil
+}
+
+// sanitizeDMARCDomain removes potentially malicious characters from domain names
+func sanitizeDMARCDomain(domain string) string {
+	// Remove control characters
+	domain = strings.Map(func(r rune) rune {
+		if r < 32 {
+			return -1
+		}
+		return r
+	}, domain)
+
+	// Limit length
+	if len(domain) > 255 {
+		domain = domain[:255]
+	}
+
+	return strings.TrimSpace(domain)
+}
+
+// sanitizeDMARCError provides user-safe error messages
+func sanitizeDMARCError(err error) string {
+	errStr := err.Error()
+	switch {
+	case strings.Contains(errStr, "path traversal"):
+		return "Invalid file path."
+	case strings.Contains(errStr, "exceeds maximum") || strings.Contains(errStr, "exceeds limit"):
+		return "File is too large."
+	case strings.Contains(errStr, "failed to parse") || strings.Contains(errStr, "invalid"):
+		return "File is not valid DMARC XML."
+	case strings.Contains(errStr, "compression ratio"):
+		return "File appears to be malformed (compression bomb detected)."
+	case strings.Contains(errStr, "no DMARC XML"):
+		return "No valid DMARC report found in archive."
+	default:
+		return "Please ensure the file is a valid DMARC aggregate report."
+	}
+}
+
+// ============================================================================
+// DMARC Report Analysis Functions
+// ============================================================================
+
+// analyzeDMARCReport performs forensic analysis on the parsed report
+func analyzeDMARCReport(report *DMARCAggregateReport) *DMARCReportAnalysis {
+	analysis := &DMARCReportAnalysis{
+		DispositionStats: make(map[string]int),
+	}
+
+	// Aggregate counters
+	var totalEmails, spfPass, dkimPass, bothPass int
+	countryStats := make(map[string]*DMARCCountryStat)
+	asnStats := make(map[uint]*DMARCASNStat)
+	var failingSources []DMARCFailingSource
+
+	for _, record := range report.Records {
+		count := record.Row.Count
+		totalEmails += count
+
+		// Track disposition
+		disp := strings.ToLower(record.Row.PolicyEvaluated.Disposition)
+		if disp == "" {
+			disp = "none"
+		}
+		analysis.DispositionStats[disp] += count
+
+		// Track authentication results
+		spfResult := strings.ToLower(record.Row.PolicyEvaluated.SPF)
+		dkimResult := strings.ToLower(record.Row.PolicyEvaluated.DKIM)
+
+		if spfResult == "pass" {
+			spfPass += count
+		}
+		if dkimResult == "pass" {
+			dkimPass += count
+		}
+		if spfResult == "pass" && dkimResult == "pass" {
+			bothPass += count
+		}
+
+		// Aggregate by country and ASN if enrichment available
+		if record.Enrichment != nil {
+			cc := record.Enrichment.CountryCode
+			if cc != "" {
+				if _, ok := countryStats[cc]; !ok {
+					countryStats[cc] = &DMARCCountryStat{
+						Country:     record.Enrichment.Country,
+						CountryCode: cc,
+					}
+				}
+				countryStats[cc].EmailCount += count
+				if spfResult != "pass" || dkimResult != "pass" {
+					countryStats[cc].FailCount += count
+				}
+			}
+
+			// ASN aggregation
+			asn := record.Enrichment.ASN
+			if asn != 0 {
+				if _, ok := asnStats[asn]; !ok {
+					asnStats[asn] = &DMARCASNStat{
+						ASN:          asn,
+						Organization: record.Enrichment.Organization,
+					}
+				}
+				asnStats[asn].EmailCount += count
+				if spfResult != "pass" || dkimResult != "pass" {
+					asnStats[asn].FailCount += count
+				}
+			}
+		}
+
+		// Track failing sources
+		if spfResult != "pass" || dkimResult != "pass" {
+			reason := determineDMARCFailReason(record)
+			fs := DMARCFailingSource{
+				IP:         record.Row.SourceIP,
+				FailCount:  count,
+				FailReason: reason,
+			}
+			if record.Enrichment != nil {
+				fs.Country = record.Enrichment.Country
+				fs.Organization = record.Enrichment.Organization
+			}
+			failingSources = append(failingSources, fs)
+		}
+	}
+
+	// Calculate rates
+	analysis.TotalEmails = totalEmails
+	if totalEmails > 0 {
+		analysis.PassRate = float64(bothPass) / float64(totalEmails) * 100
+		analysis.SPFPassRate = float64(spfPass) / float64(totalEmails) * 100
+		analysis.DKIMPassRate = float64(dkimPass) / float64(totalEmails) * 100
+	}
+
+	// Sort and limit top countries
+	analysis.TopSourceCountries = topNDMARCCountries(countryStats, 10)
+	analysis.TopASNs = topNDMARCASNs(asnStats, 10)
+
+	// Sort failing sources by count
+	sort.Slice(failingSources, func(i, j int) bool {
+		return failingSources[i].FailCount > failingSources[j].FailCount
+	})
+	if len(failingSources) > 10 {
+		failingSources = failingSources[:10]
+	}
+	analysis.FailingSources = failingSources
+
+	// Generate recommendations
+	analysis.Recommendations = generateDMARCRecommendations(report, analysis)
+	analysis.OverallThreatLevel = calculateDMARCOverallThreat(analysis)
+
+	return analysis
+}
+
+// determineDMARCFailReason determines why a record failed authentication
+func determineDMARCFailReason(record DMARCAggregateRecord) string {
+	spf := strings.ToLower(record.Row.PolicyEvaluated.SPF)
+	dkim := strings.ToLower(record.Row.PolicyEvaluated.DKIM)
+
+	switch {
+	case spf != "pass" && dkim != "pass":
+		return "Both SPF and DKIM failed"
+	case spf != "pass":
+		return "SPF failed"
+	case dkim != "pass":
+		return "DKIM failed"
+	default:
+		return "Unknown"
+	}
+}
+
+// topNDMARCCountries returns the top N countries by email count
+func topNDMARCCountries(stats map[string]*DMARCCountryStat, n int) []DMARCCountryStat {
+	var result []DMARCCountryStat
+	for _, stat := range stats {
+		result = append(result, *stat)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].EmailCount > result[j].EmailCount
+	})
+	if len(result) > n {
+		result = result[:n]
+	}
+	return result
+}
+
+// topNDMARCASNs returns the top N ASNs by email count
+func topNDMARCASNs(stats map[uint]*DMARCASNStat, n int) []DMARCASNStat {
+	var result []DMARCASNStat
+	for _, stat := range stats {
+		result = append(result, *stat)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].EmailCount > result[j].EmailCount
+	})
+	if len(result) > n {
+		result = result[:n]
+	}
+	return result
+}
+
+// generateDMARCRecommendations generates actionable recommendations based on analysis
+func generateDMARCRecommendations(report *DMARCAggregateReport, analysis *DMARCReportAnalysis) []DMARCRecommendation {
+	var recommendations []DMARCRecommendation
+
+	// Check policy strength
+	policy := strings.ToLower(report.PolicyPublished.Policy)
+	if policy == "none" {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "high",
+			Category:    "policy",
+			Title:       "Upgrade DMARC Policy",
+			Description: "Your DMARC policy is set to 'none', which only monitors but doesn't protect against spoofing.",
+			Action:      "Consider upgrading to 'quarantine' or 'reject' policy after verifying all legitimate sources pass authentication.",
+		})
+	} else if policy == "quarantine" && analysis.PassRate >= 95 {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "medium",
+			Category:    "policy",
+			Title:       "Consider Reject Policy",
+			Description: "Your pass rate is high enough to consider upgrading to 'reject' policy for maximum protection.",
+			Action:      "Upgrade DMARC policy from 'quarantine' to 'reject' for stronger spoofing protection.",
+		})
+	}
+
+	// Check percentage
+	if report.PolicyPublished.Percentage < 100 && report.PolicyPublished.Percentage > 0 {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "medium",
+			Category:    "policy",
+			Title:       "Increase Policy Coverage",
+			Description: fmt.Sprintf("Your DMARC policy only applies to %d%% of messages.", report.PolicyPublished.Percentage),
+			Action:      "Gradually increase pct= value to 100 for full protection.",
+		})
+	}
+
+	// Check SPF alignment
+	if analysis.SPFPassRate < 90 && analysis.SPFPassRate > 0 {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "high",
+			Category:    "spf",
+			Title:       "Improve SPF Configuration",
+			Description: fmt.Sprintf("SPF pass rate is only %.1f%%, indicating configuration issues.", analysis.SPFPassRate),
+			Action:      "Review SPF records to ensure all legitimate sending sources are included.",
+		})
+	}
+
+	// Check DKIM alignment
+	if analysis.DKIMPassRate < 90 && analysis.DKIMPassRate > 0 {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "high",
+			Category:    "dkim",
+			Title:       "Improve DKIM Configuration",
+			Description: fmt.Sprintf("DKIM pass rate is only %.1f%%, indicating signing issues.", analysis.DKIMPassRate),
+			Action:      "Verify DKIM signing is enabled for all email sources and keys are properly published.",
+		})
+	}
+
+	// Check for significant failures
+	if len(analysis.FailingSources) > 5 {
+		recommendations = append(recommendations, DMARCRecommendation{
+			Priority:    "medium",
+			Category:    "monitoring",
+			Title:       "Investigate Failing Sources",
+			Description: fmt.Sprintf("Found %d sources with authentication failures.", len(analysis.FailingSources)),
+			Action:      "Review failing sources to identify if they are legitimate services that need configuration or potential spoofing attempts.",
+		})
+	}
+
+	return recommendations
+}
+
+// calculateDMARCOverallThreat calculates the overall threat level
+func calculateDMARCOverallThreat(analysis *DMARCReportAnalysis) string {
+	// Calculate based on pass rate and failure volume
+	if analysis.PassRate >= 95 {
+		return "low"
+	} else if analysis.PassRate >= 80 {
+		return "medium"
+	} else if analysis.PassRate >= 50 {
+		return "high"
+	}
+	return "critical"
+}
+
+// ============================================================================
+// DMARC IP Enrichment Functions
+// ============================================================================
+
+// enrichDMARCReport enriches the report with IP geolocation data
+func enrichDMARCReport(report *DMARCAggregateReport, geoDBPath string) {
+	// Try to find GeoIP database
+	dbPaths := []string{geoDBPath}
+	if geoDBPath == "" {
+		// Check common locations
+		dbPaths = []string{
+			os.Getenv("GEOIP_DB_PATH"),
+			"./GeoLite2-City.mmdb",
+			"./data/GeoLite2-City.mmdb",
+			"/usr/share/GeoIP/GeoLite2-City.mmdb",
+			"/var/lib/GeoIP/GeoLite2-City.mmdb",
+		}
+	}
+
+	var cityDB *geoip2.Reader
+	for _, path := range dbPaths {
+		if path == "" {
+			continue
+		}
+		var err error
+		cityDB, err = geoip2.Open(path)
+		if err == nil {
+			defer func() { _ = cityDB.Close() }()
+			break
+		}
+	}
+
+	// Try to open ASN database for autonomous system lookups
+	// Note: ASN data requires a separate GeoLite2-ASN.mmdb database
+	asnDBPaths := []string{
+		os.Getenv("GEOIP_ASN_DB_PATH"),
+		"./GeoLite2-ASN.mmdb",
+		"./data/GeoLite2-ASN.mmdb",
+		"/usr/share/GeoIP/GeoLite2-ASN.mmdb",
+		"/var/lib/GeoIP/GeoLite2-ASN.mmdb",
+	}
+	var asnDB *geoip2.Reader
+	for _, path := range asnDBPaths {
+		if path == "" {
+			continue
+		}
+		var err error
+		asnDB, err = geoip2.Open(path)
+		if err == nil {
+			defer func() { _ = asnDB.Close() }()
+			break
+		}
+	}
+
+	// Calculate average volume for threat scoring
+	var totalEmails int
+	for _, record := range report.Records {
+		totalEmails += record.Row.Count
+	}
+	avgVolume := 1.0
+	if len(report.Records) > 0 {
+		avgVolume = float64(totalEmails) / float64(len(report.Records))
+	}
+
+	// Enrich each record
+	for i := range report.Records {
+		ip := net.ParseIP(report.Records[i].Row.SourceIP)
+		if ip == nil {
+			continue
+		}
+
+		enrichment := &IPEnrichment{}
+
+		// GeoIP City lookup if database available
+		if cityDB != nil {
+			record, err := cityDB.City(ip)
+			if err == nil {
+				enrichment.Country = record.Country.Names["en"]
+				enrichment.CountryCode = record.Country.IsoCode
+				if len(record.City.Names) > 0 {
+					enrichment.City = record.City.Names["en"]
+				}
+			}
+		}
+
+		// ASN lookup requires separate GeoLite2-ASN database
+		if asnDB != nil {
+			asnRecord, err := asnDB.ASN(ip)
+			if err == nil {
+				enrichment.ASN = asnRecord.AutonomousSystemNumber
+				enrichment.Organization = asnRecord.AutonomousSystemOrganization
+			}
+		}
+
+		// Calculate threat score
+		enrichment.ThreatScore = calculateDMARCThreatScore(&report.Records[i], avgVolume)
+		enrichment.ThreatLevel = threatLevelFromScore(enrichment.ThreatScore)
+
+		report.Records[i].Enrichment = enrichment
+	}
+}
+
+// calculateDMARCThreatScore computes a risk score (0-100) for a DMARC record
+func calculateDMARCThreatScore(record *DMARCAggregateRecord, avgVolume float64) float64 {
+	score := 0.0
+
+	// Authentication failures (0-40 points)
+	if strings.ToLower(record.Row.PolicyEvaluated.SPF) != "pass" {
+		score += 20
+	}
+	if strings.ToLower(record.Row.PolicyEvaluated.DKIM) != "pass" {
+		score += 20
+	}
+
+	// Volume anomaly (0-30 points)
+	if float64(record.Row.Count) > avgVolume*3 {
+		score += 30
+	} else if float64(record.Row.Count) > avgVolume*2 {
+		score += 15
+	}
+
+	// Policy disposition (0-20 points)
+	switch strings.ToLower(record.Row.PolicyEvaluated.Disposition) {
+	case "reject":
+		score += 20
+	case "quarantine":
+		score += 10
+	}
+
+	// Cap at 100
+	if score > 100 {
+		score = 100
+	}
+
+	return score
+}
+
+// threatLevelFromScore converts a numeric score to threat level
+func threatLevelFromScore(score float64) string {
+	switch {
+	case score >= 70:
+		return "critical"
+	case score >= 50:
+		return "high"
+	case score >= 30:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
+// ============================================================================
+// DMARC Output Functions
+// ============================================================================
+
+// outputDMARCJSON outputs the DMARC report as JSON
+func outputDMARCJSON(report *DMARCAggregateReport) {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(true)
+	if err := encoder.Encode(report); err != nil {
+		log.Printf("Error encoding JSON: %v", err)
+		os.Exit(1)
+	}
+}
+
+// outputDMARCText outputs the DMARC report in human-readable text format
+func outputDMARCText(report *DMARCAggregateReport, verbose bool) {
+	fmt.Println("=" + strings.Repeat("=", 79))
+	fmt.Println("DMARC AGGREGATE REPORT ANALYSIS")
+	fmt.Println("=" + strings.Repeat("=", 79))
+	fmt.Println()
+
+	// Report Metadata
+	fmt.Println("REPORT INFORMATION")
+	fmt.Println("-" + strings.Repeat("-", 79))
+	fmt.Printf("Organization:  %s\n", report.Metadata.OrgName)
+	fmt.Printf("Report ID:     %s\n", report.Metadata.ReportID)
+	fmt.Printf("Email:         %s\n", report.Metadata.Email)
+	fmt.Printf("Period:        %s to %s\n",
+		formatUnixTime(report.Metadata.DateRange.Begin),
+		formatUnixTime(report.Metadata.DateRange.End))
+	fmt.Println()
+
+	// Policy Published
+	fmt.Println("DOMAIN POLICY")
+	fmt.Println("-" + strings.Repeat("-", 79))
+	fmt.Printf("Domain:        %s\n", report.PolicyPublished.Domain)
+	fmt.Printf("Policy (p):    %s\n", formatDMARCPolicy(report.PolicyPublished.Policy))
+	fmt.Printf("Subdomain (sp): %s\n", formatDMARCPolicy(report.PolicyPublished.SubdomainPolicy))
+	fmt.Printf("DKIM Align:    %s\n", formatDMARCAlignment(report.PolicyPublished.ADKIM))
+	fmt.Printf("SPF Align:     %s\n", formatDMARCAlignment(report.PolicyPublished.ASPF))
+	fmt.Printf("Percentage:    %d%%\n", report.PolicyPublished.Percentage)
+	fmt.Println()
+
+	// Analysis Summary
+	if report.Analysis != nil {
+		fmt.Println("AUTHENTICATION SUMMARY")
+		fmt.Println("-" + strings.Repeat("-", 79))
+		fmt.Printf("Total Emails:     %d\n", report.Analysis.TotalEmails)
+		fmt.Printf("Overall Pass:     %.1f%% %s\n",
+			report.Analysis.PassRate, passRateSymbol(report.Analysis.PassRate))
+		fmt.Printf("SPF Pass Rate:    %.1f%% %s\n",
+			report.Analysis.SPFPassRate, passRateSymbol(report.Analysis.SPFPassRate))
+		fmt.Printf("DKIM Pass Rate:   %.1f%% %s\n",
+			report.Analysis.DKIMPassRate, passRateSymbol(report.Analysis.DKIMPassRate))
+		fmt.Println()
+
+		// Disposition breakdown
+		fmt.Println("Disposition:")
+		for disp, count := range report.Analysis.DispositionStats {
+			pct := 0.0
+			if report.Analysis.TotalEmails > 0 {
+				pct = float64(count) / float64(report.Analysis.TotalEmails) * 100
+			}
+			fmt.Printf("  %-12s %6d (%.1f%%)\n", disp+":", count, pct)
+		}
+		fmt.Println()
+
+		// Top source countries
+		if len(report.Analysis.TopSourceCountries) > 0 {
+			fmt.Println("TOP SOURCE COUNTRIES")
+			fmt.Println("-" + strings.Repeat("-", 79))
+			limit := min(5, len(report.Analysis.TopSourceCountries))
+			for i := 0; i < limit; i++ {
+				cs := report.Analysis.TopSourceCountries[i]
+				fmt.Printf("  %d. %s (%s): %d emails, %d failures\n",
+					i+1, cs.Country, cs.CountryCode, cs.EmailCount, cs.FailCount)
+			}
+			fmt.Println()
+		}
+
+		// Top ASNs
+		if len(report.Analysis.TopASNs) > 0 {
+			fmt.Println("TOP SOURCE ORGANIZATIONS")
+			fmt.Println("-" + strings.Repeat("-", 79))
+			limit := min(5, len(report.Analysis.TopASNs))
+			for i := 0; i < limit; i++ {
+				asn := report.Analysis.TopASNs[i]
+				fmt.Printf("  %d. %s (AS%d): %d emails, %d failures\n",
+					i+1, asn.Organization, asn.ASN, asn.EmailCount, asn.FailCount)
+			}
+			fmt.Println()
+		}
+
+		// Failing sources
+		if len(report.Analysis.FailingSources) > 0 {
+			fmt.Println("FAILING SOURCES")
+			fmt.Println("-" + strings.Repeat("-", 79))
+			limit := min(10, len(report.Analysis.FailingSources))
+			for i := 0; i < limit; i++ {
+				fs := report.Analysis.FailingSources[i]
+				location := ""
+				if fs.Country != "" {
+					location = fmt.Sprintf(" (%s)", fs.Country)
+				}
+				org := ""
+				if fs.Organization != "" {
+					org = fmt.Sprintf(" - %s", fs.Organization)
+				}
+				fmt.Printf("  %s%s%s: %d failures - %s\n",
+					fs.IP, location, org, fs.FailCount, fs.FailReason)
+			}
+			fmt.Println()
+		}
+
+		// Recommendations
+		if len(report.Analysis.Recommendations) > 0 {
+			fmt.Println("RECOMMENDATIONS")
+			fmt.Println("-" + strings.Repeat("-", 79))
+			for _, rec := range report.Analysis.Recommendations {
+				fmt.Printf("  [%s] %s\n", strings.ToUpper(rec.Priority), rec.Title)
+				fmt.Printf("         %s\n", rec.Description)
+				fmt.Printf("         Action: %s\n", rec.Action)
+				fmt.Println()
+			}
+		}
+
+		// Threat assessment
+		fmt.Println("THREAT ASSESSMENT")
+		fmt.Println("-" + strings.Repeat("-", 79))
+		fmt.Printf("Overall Threat Level: %s %s\n",
+			strings.ToUpper(report.Analysis.OverallThreatLevel),
+			threatSymbol(report.Analysis.OverallThreatLevel))
+	}
+
+	// Verbose: show all records
+	if verbose {
+		fmt.Println()
+		fmt.Println("DETAILED RECORDS")
+		fmt.Println("-" + strings.Repeat("-", 79))
+		for i, record := range report.Records {
+			fmt.Printf("\nRecord #%d:\n", i+1)
+			fmt.Printf("  Source IP:    %s\n", record.Row.SourceIP)
+			fmt.Printf("  Count:        %d\n", record.Row.Count)
+			fmt.Printf("  SPF:          %s\n", formatResult(record.Row.PolicyEvaluated.SPF))
+			fmt.Printf("  DKIM:         %s\n", formatResult(record.Row.PolicyEvaluated.DKIM))
+			fmt.Printf("  Disposition:  %s\n", record.Row.PolicyEvaluated.Disposition)
+			fmt.Printf("  Header From:  %s\n", record.Identifiers.HeaderFrom)
+			if record.Enrichment != nil {
+				if record.Enrichment.Country != "" {
+					fmt.Printf("  Location:     %s, %s\n", record.Enrichment.City, record.Enrichment.Country)
+				}
+				if record.Enrichment.Organization != "" {
+					fmt.Printf("  Organization: %s (AS%d)\n", record.Enrichment.Organization, record.Enrichment.ASN)
+				}
+				fmt.Printf("  Threat Score: %.0f (%s)\n", record.Enrichment.ThreatScore, record.Enrichment.ThreatLevel)
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("=" + strings.Repeat("=", 79))
+}
+
+// outputDMARCMarkdown outputs the DMARC report in Markdown format
+func outputDMARCMarkdown(report *DMARCAggregateReport, verbose bool) {
+	fmt.Println("# DMARC Aggregate Report Analysis")
+	fmt.Println()
+
+	// Metadata
+	fmt.Println("## Report Information")
+	fmt.Println()
+	fmt.Println("| Field | Value |")
+	fmt.Println("|-------|-------|")
+	fmt.Printf("| Organization | %s |\n", escapeMarkdown(report.Metadata.OrgName))
+	fmt.Printf("| Report ID | `%s` |\n", report.Metadata.ReportID)
+	fmt.Printf("| Email | %s |\n", report.Metadata.Email)
+	fmt.Printf("| Period | %s to %s |\n",
+		formatUnixTime(report.Metadata.DateRange.Begin),
+		formatUnixTime(report.Metadata.DateRange.End))
+	fmt.Println()
+
+	// Policy
+	fmt.Println("## Domain Policy")
+	fmt.Println()
+	fmt.Printf("- **Domain**: %s\n", report.PolicyPublished.Domain)
+	fmt.Printf("- **Policy**: `%s`\n", report.PolicyPublished.Policy)
+	fmt.Printf("- **Subdomain Policy**: `%s`\n", report.PolicyPublished.SubdomainPolicy)
+	fmt.Printf("- **DKIM Alignment**: %s\n", alignmentDescription(report.PolicyPublished.ADKIM))
+	fmt.Printf("- **SPF Alignment**: %s\n", alignmentDescription(report.PolicyPublished.ASPF))
+	fmt.Printf("- **Percentage**: %d%%\n", report.PolicyPublished.Percentage)
+	fmt.Println()
+
+	if report.Analysis != nil {
+		// Summary table
+		fmt.Println("## Authentication Summary")
+		fmt.Println()
+		fmt.Println("| Metric | Value | Status |")
+		fmt.Println("|--------|-------|--------|")
+		fmt.Printf("| Total Emails | %d | - |\n", report.Analysis.TotalEmails)
+		fmt.Printf("| Overall Pass Rate | %.1f%% | %s |\n",
+			report.Analysis.PassRate, markdownStatus(report.Analysis.PassRate))
+		fmt.Printf("| SPF Pass Rate | %.1f%% | %s |\n",
+			report.Analysis.SPFPassRate, markdownStatus(report.Analysis.SPFPassRate))
+		fmt.Printf("| DKIM Pass Rate | %.1f%% | %s |\n",
+			report.Analysis.DKIMPassRate, markdownStatus(report.Analysis.DKIMPassRate))
+		fmt.Println()
+
+		// Disposition
+		fmt.Println("### Disposition Breakdown")
+		fmt.Println()
+		fmt.Println("| Disposition | Count | Percentage |")
+		fmt.Println("|-------------|-------|------------|")
+		for disp, count := range report.Analysis.DispositionStats {
+			pct := 0.0
+			if report.Analysis.TotalEmails > 0 {
+				pct = float64(count) / float64(report.Analysis.TotalEmails) * 100
+			}
+			fmt.Printf("| %s | %d | %.1f%% |\n", disp, count, pct)
+		}
+		fmt.Println()
+
+		// Top countries table
+		if len(report.Analysis.TopSourceCountries) > 0 {
+			fmt.Println("## Top Source Countries")
+			fmt.Println()
+			fmt.Println("| Country | Code | Emails | Failures |")
+			fmt.Println("|---------|------|--------|----------|")
+			limit := min(10, len(report.Analysis.TopSourceCountries))
+			for i := 0; i < limit; i++ {
+				cs := report.Analysis.TopSourceCountries[i]
+				fmt.Printf("| %s | %s | %d | %d |\n",
+					escapeMarkdown(cs.Country), cs.CountryCode, cs.EmailCount, cs.FailCount)
+			}
+			fmt.Println()
+		}
+
+		// Failing sources
+		if len(report.Analysis.FailingSources) > 0 {
+			fmt.Println("## Failing Sources")
+			fmt.Println()
+			fmt.Println("| IP Address | Country | Organization | Failures | Reason |")
+			fmt.Println("|------------|---------|--------------|----------|--------|")
+			limit := min(10, len(report.Analysis.FailingSources))
+			for i := 0; i < limit; i++ {
+				fs := report.Analysis.FailingSources[i]
+				fmt.Printf("| %s | %s | %s | %d | %s |\n",
+					fs.IP, fs.Country, escapeMarkdown(fs.Organization), fs.FailCount, fs.FailReason)
+			}
+			fmt.Println()
+		}
+
+		// Recommendations
+		if len(report.Analysis.Recommendations) > 0 {
+			fmt.Println("## Recommendations")
+			fmt.Println()
+			for _, rec := range report.Analysis.Recommendations {
+				fmt.Printf("### %s %s\n", priorityEmoji(rec.Priority), rec.Title)
+				fmt.Println()
+				fmt.Printf("%s\n", rec.Description)
+				fmt.Println()
+				fmt.Printf("**Action**: %s\n", rec.Action)
+				fmt.Println()
+			}
+		}
+
+		// Threat assessment
+		fmt.Println("## Threat Assessment")
+		fmt.Println()
+		fmt.Printf("**Overall Threat Level**: %s %s\n",
+			strings.ToUpper(report.Analysis.OverallThreatLevel),
+			threatEmoji(report.Analysis.OverallThreatLevel))
+	}
+
+	// Verbose: all records as table
+	if verbose && len(report.Records) > 0 {
+		fmt.Println()
+		fmt.Println("## Detailed Records")
+		fmt.Println()
+		fmt.Println("| # | Source IP | Count | SPF | DKIM | Disposition | Header From |")
+		fmt.Println("|---|-----------|-------|-----|------|-------------|-------------|")
+		for i, record := range report.Records {
+			fmt.Printf("| %d | %s | %d | %s | %s | %s | %s |\n",
+				i+1,
+				record.Row.SourceIP,
+				record.Row.Count,
+				record.Row.PolicyEvaluated.SPF,
+				record.Row.PolicyEvaluated.DKIM,
+				record.Row.PolicyEvaluated.Disposition,
+				record.Identifiers.HeaderFrom)
+		}
+	}
+}
+
+// Helper functions for DMARC output
+
+func formatUnixTime(timestamp int64) string {
+	return time.Unix(timestamp, 0).UTC().Format("2006-01-02 15:04 UTC")
+}
+
+func formatDMARCPolicy(policy string) string {
+	switch strings.ToLower(policy) {
+	case "none":
+		return "none (monitor only)"
+	case "quarantine":
+		return "quarantine (mark as suspicious)"
+	case "reject":
+		return "reject (block delivery)"
+	default:
+		return policy
+	}
+}
+
+func formatDMARCAlignment(align string) string {
+	switch strings.ToLower(align) {
+	case "r":
+		return "relaxed"
+	case "s":
+		return "strict"
+	default:
+		return align
+	}
+}
+
+func passRateSymbol(rate float64) string {
+	if rate >= 95 {
+		return "✓"
+	} else if rate >= 80 {
+		return "⚠"
+	}
+	return "✗"
+}
+
+func threatSymbol(level string) string {
+	switch strings.ToLower(level) {
+	case "low":
+		return "✓"
+	case "medium":
+		return "⚠"
+	case "high":
+		return "✗"
+	case "critical":
+		return "✗✗"
+	default:
+		return ""
+	}
+}
+
+func escapeMarkdown(s string) string {
+	// Escape pipe characters for markdown tables
+	return strings.ReplaceAll(s, "|", "\\|")
+}
+
+func alignmentDescription(align string) string {
+	switch strings.ToLower(align) {
+	case "r":
+		return "Relaxed (organizational domain match)"
+	case "s":
+		return "Strict (exact domain match)"
+	default:
+		return align
+	}
+}
+
+func markdownStatus(rate float64) string {
+	if rate >= 95 {
+		return "Good"
+	} else if rate >= 80 {
+		return "Warning"
+	}
+	return "Critical"
+}
+
+func priorityEmoji(priority string) string {
+	switch strings.ToLower(priority) {
+	case "high":
+		return "[HIGH]"
+	case "medium":
+		return "[MEDIUM]"
+	case "low":
+		return "[LOW]"
+	default:
+		return ""
+	}
+}
+
+func threatEmoji(level string) string {
+	switch strings.ToLower(level) {
+	case "low":
+		return "(Good)"
+	case "medium":
+		return "(Warning)"
+	case "high":
+		return "(Elevated Risk)"
+	case "critical":
+		return "(CRITICAL)"
+	default:
+		return ""
+	}
 }
 
 // min returns the minimum of two integers
