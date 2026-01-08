@@ -2,7 +2,8 @@
 
 ![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/charlesgreen/email?utm_source=oss&utm_medium=github&utm_campaign=charlesgreen%2Femail&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
-A Golang tool for analyzing email security authentication headers (SPF, DKIM, DMARC, and ARC) from `.msg` and `.eml` files, plus DMARC aggregate report analysis with forensic capabilities.
+A Golang tool for analyzing email security authentication headers (SPF, DKIM, DMARC, and ARC) from `.msg` and `.eml` files, plus DMARC aggregate report analysis with forensic
+capabilities.
 
 ## Features
 
@@ -31,8 +32,8 @@ Requires Go 1.20 or later.
 # Install latest version
 go install github.com/charlesgreen/email@latest
 
-# Install specific version (v0.2.0 - includes DMARC report analysis)
-go install github.com/charlesgreen/email@v0.2.0
+# Install specific version (v0.2.2 - includes DMARC report analysis)
+go install github.com/charlesgreen/email@v0.2.2
 ```
 
 To uninstall:
